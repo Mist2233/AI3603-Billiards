@@ -33,8 +33,6 @@ agent_a, agent_b = BasicAgent(), NewAgent()
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ["solid", "solid", "stripe", "stripe"]  # 轮换球型
 
-n_games = 40
-
 for i in range(n_games):
     print()
     print(f"------- 第 {i} 局比赛开始 -------")
