@@ -26,98 +26,77 @@ def benchmark_agent(num_episodes=20):
     
     print(f"Starting benchmark for {num_episodes} episodes...")
     
+    # 模拟 evaluate.py 的先后手轮换机制
+    players = [agent_a, agent_b]
+    target_ball_choice = ["solid", "solid", "stripe", "stripe"]
+    
     for i in range(num_episodes):
-        # 决定谁打什么球
-        target_ball_type = 'solid' if i % 2 == 0 else 'stripe'
+        print()
+        print(f"------- 第 {i} 局比赛开始 -------")
+        # 决定谁打什么球 (与 evaluate.py 一致)
+        current_target_ball = target_ball_choice[i % 4]
         try:
-            obs = env.reset(target_ball=target_ball_type)
+            obs = env.reset(target_ball=current_target_ball)
         except TypeError:
-            # Fallback for old poolenv version if needed, but we saw code requires target_ball
-            obs = env.reset(target_ball=target_ball_type)
+            obs = env.reset(target_ball=current_target_ball)
+            
+        player_class = players[i % 2].__class__.__name__
+        print(f"本局 Player A: {player_class}, 目标球型: {current_target_ball}")
             
         done = False
         step_count = 0
         
         while not done:
-            current_player_idx = env.curr_player # 0 or 1
-            # 假设 idx 0 是 Agent A (Basic), idx 1 是 Agent B (New)
-            # 根据 evaluate.py 的逻辑，通常偶数局 Agent A 先手，奇数局 Agent B 先手
+            player_id = env.get_curr_player() # 'A' or 'B'
+            print(f"[第{env.hit_count}次击球] player: {player_id}")
             
-            # 实际上 PoolEnv 内部维护了 turn
-            
-            # obs['balls'] might be None in some env implementations if not returned by reset/step
-            # But looking at poolenv.py, reset returns nothing? Wait.
-            # poolenv.py:224 reset ends without return?
-            # Let's check poolenv.py reset return value.
-            
-            balls_data = env.balls
-            player_targets = env.player_targets
-            
-            if current_player_idx == 0:
-                action = agent_a.decision(
-                    balls=balls_data,
-                    my_targets=player_targets['A'],
-                    table=env.table
-                )
+            # 关键修复：根据 evaluate.py 的逻辑选择 Agent
+            # i % 2 == 0: Agent A (Basic) is Player A, Agent B (New) is Player B
+            if player_id == "A":
+                current_agent = players[i % 2]
             else:
-                action = agent_b.decision(
-                    balls=balls_data,
-                    my_targets=player_targets['B'],
-                    table=env.table
-                )
-                
-            step_result = env.take_shot(action)
-            # take_shot returns dict
+                current_agent = players[(i + 1) % 2]
             
+            # 获取观测
+            obs = env.get_observation(player_id)
+            # 决策
+            action = current_agent.decision(*obs)
+            
+            # 打印决策信息 (Optional)
+            if isinstance(current_agent, NewAgent):
+                # print(f"NewAgent Action: V0={action['V0']:.2f}, phi={action['phi']:.2f}")
+                pass
+                
+            # 执行
+            step_info = env.take_shot(action)
+            
+            # 检查结束
             done, info = env.get_done()
             
-            step_count += 1
-            
-            if current_player_idx == 1:
-                results['Total_Shots'] += 1
-                # Check for foul in current step result
-                # step_result is dict with keys: 'ME_INTO_POCKET', 'ENEMY_INTO_POCKET', 'WHITE_BALL_INTO_POCKET', 'BLACK_BALL_INTO_POCKET', 'FOUL_FIRST_HIT', 'NO_POCKET_NO_RAIL', 'NO_HIT', 'BALLS'
+            if done:
+                winner = info['winner']
+                print(f"Game Over. Winner: {winner}")
                 
-                is_foul = False
-                if step_result.get('WHITE_BALL_INTO_POCKET', False):
-                    is_foul = True
-                elif step_result.get('FOUL_FIRST_HIT', False):
-                    is_foul = True
-                elif step_result.get('NO_POCKET_NO_RAIL', False):
-                    # In some rules this is a foul, but poolenv.py logic seems to just swap turns?
-                    # Let's check poolenv.py logic.
-                    # line 395: returns 'NO_HIT': True, which implies foul/swap turn usually.
-                    # line 380: self.curr_player = 1 - self.curr_player (swaps turn)
-                    pass
-                elif step_result.get('NO_HIT', False):
-                     # poolenv line 379: "本杆白球未接触任何球，交换球权" -> usually a foul in pool
-                     is_foul = True
-                
-                if is_foul:
-                    results['Fouls'] += 1
-            
-        winner = env.winner
-        # env.winner returns 'A' or 'B' or 'SAME' or None
-        
-        # We need to map 'A'/'B' to 0/1 based on who was who.
-        # But wait, we fixed A=Basic, B=NewAgent in our loop logic above:
-        # if current_player_idx == 0: agent_a (Basic)
-        # else: agent_b (New)
-        # And poolenv usually maps idx 0 -> 'A', idx 1 -> 'B' (see poolenv.py:232)
-        
-        if winner == 'B': # NewAgent won
-            results['NewAgent_Win'] += 1
-        elif winner == 'A': # BasicAgent won
-            results['BasicAgent_Win'] += 1
-        else:
-            results['Draw'] += 1
-            
-        print(f"Episode {i+1}/{num_episodes} finished. Winner: {'NewAgent' if winner==1 else 'BasicAgent' if winner==0 else 'Draw'}")
+                if winner == 'SAME':
+                    results['Draw'] += 1
+                elif winner == 'A':
+                    # 如果 Player A 赢了，看谁是 Player A
+                    if i % 2 == 0:
+                        results['BasicAgent_Win'] += 1 # Basic was A
+                    else:
+                        results['NewAgent_Win'] += 1   # New was A
+                elif winner == 'B':
+                    # 如果 Player B 赢了，看谁是 Player B
+                    if i % 2 == 0:
+                        results['NewAgent_Win'] += 1   # New was B
+                    else:
+                        results['BasicAgent_Win'] += 1 # Basic was B
 
+    # 计算胜率 (NewAgent)
+    win_rate = (results['NewAgent_Win'] + 0.5 * results['Draw']) / num_episodes
     print("\nBenchmark Results:")
-    print(f"NewAgent Wins: {results['NewAgent_Win']} ({results['NewAgent_Win']/num_episodes*100:.1f}%)")
-    print(f"BasicAgent Wins: {results['BasicAgent_Win']} ({results['BasicAgent_Win']/num_episodes*100:.1f}%)")
-    print(f"Foul Rate (NewAgent): {results['Fouls']}/{results['Total_Shots']} ({results['Fouls']/max(1, results['Total_Shots'])*100:.1f}%)")
+    print(f"NewAgent Win Rate: {win_rate:.2%}")
+    print(f"Details: {results}")
 
 if __name__ == "__main__":
     benchmark_agent()
