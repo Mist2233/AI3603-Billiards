@@ -9,6 +9,7 @@ agent.py - Agent 决策模块
 """
 
 import math
+import time
 import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
@@ -16,7 +17,6 @@ import copy
 import os
 from datetime import datetime
 import random
-
 import signal
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
@@ -87,18 +87,14 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
         - 清台前：player_targets = ['1'-'7'] 或 ['9'-'15']，黑8不属于任何人
         - 清台后：player_targets = ['8']，黑8成为唯一目标球
     """
-
+    
     # 1. 基本分析
     new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4]
     
     # 根据 player_targets 判断进球归属（黑8只有在清台后才算己方球）
     own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
-    enemy_pocketed = [
-        bid
-        for bid in new_pocketed
-        if bid not in player_targets and bid not in ["cue", "8"]
-    ]
-
+    enemy_pocketed = [bid for bid in new_pocketed if bid not in player_targets and bid not in ["cue", "8"]]
+    
     cue_pocketed = "cue" in new_pocketed
     eight_pocketed = "8" in new_pocketed
 
@@ -126,44 +122,22 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
         # 首次击打的球必须是 player_targets 中的球
         if first_contact_ball_id not in player_targets:
             foul_first_hit = True
-    else:
-        remaining_own_before = [
-            bid for bid in player_targets if last_state[bid].state.s != 4
-        ]
-        opponent_plus_eight = [
-            bid
-            for bid in last_state.keys()
-            if bid not in player_targets and bid not in ["cue"]
-        ]
-        if "8" not in opponent_plus_eight:
-            opponent_plus_eight.append("8")
-
-        if (
-            len(remaining_own_before) > 0
-            and first_contact_ball_id in opponent_plus_eight
-        ):
-            foul_first_hit = True
-
+    
     # 3. 分析碰库
     cue_hit_cushion = False
     target_hit_cushion = False
     foul_no_rail = False
-
+    
     for e in shot.events:
         et = str(e.event_type).lower()
-        ids = list(e.ids) if hasattr(e, "ids") else []
-        if "cushion" in et:
-            if "cue" in ids:
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if 'cushion' in et:
+            if 'cue' in ids:
                 cue_hit_cushion = True
             if first_contact_ball_id is not None and first_contact_ball_id in ids:
                 target_hit_cushion = True
 
-    if (
-        len(new_pocketed) == 0
-        and first_contact_ball_id is not None
-        and (not cue_hit_cushion)
-        and (not target_hit_cushion)
-    ):
+    if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
         foul_no_rail = True
         
     # 4. 计算奖励分数
@@ -194,28 +168,24 @@ def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: l
     # 合法无进球小奖励
     if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
         score = 10
-
+        
     return score
 
-
-class Agent:
+class Agent():
     """Agent 基类"""
-
     def __init__(self):
         pass
-
+    
     def decision(self, *args, **kwargs):
         """决策方法（子类需实现）
-
+        
         返回：dict, 包含 'V0', 'phi', 'theta', 'a', 'b'
         """
         pass
-
-    def _random_action(
-        self,
-    ):
+    
+    def _random_action(self,):
         """生成随机击球动作
-
+        
         返回：dict
             V0: [0.5, 8.0] m/s
             phi: [0, 360] 度
@@ -223,55 +193,61 @@ class Agent:
             a, b: [-0.5, 0.5] 球半径比例
         """
         action = {
-            "V0": round(random.uniform(0.5, 8.0), 2),  # 初速度 0.5~8.0 m/s
-            "phi": round(random.uniform(0, 360), 2),  # 水平角度 (0°~360°)
-            "theta": round(random.uniform(0, 90), 2),  # 垂直角度
-            "a": round(
-                random.uniform(-0.5, 0.5), 3
-            ),  # 杆头横向偏移（单位：球半径比例）
-            "b": round(random.uniform(-0.5, 0.5), 3),  # 杆头纵向偏移
+            'V0': round(random.uniform(0.5, 8.0), 2),   # 初速度 0.5~8.0 m/s
+            'phi': round(random.uniform(0, 360), 2),    # 水平角度 (0°~360°)
+            'theta': round(random.uniform(0, 90), 2),   # 垂直角度
+            'a': round(random.uniform(-0.5, 0.5), 3),   # 杆头横向偏移（单位：球半径比例）
+            'b': round(random.uniform(-0.5, 0.5), 3)    # 杆头纵向偏移
         }
         return action
 
 
+
 class BasicAgent(Agent):
     """基于贝叶斯优化的智能 Agent"""
-
+    
     def __init__(self, target_balls=None):
         """初始化 Agent
-
+        
         参数：
             target_balls: 保留参数，暂未使用
         """
         super().__init__()
-
+        
         # 搜索空间
         self.pbounds = {
-            "V0": (0.5, 8.0),
-            "phi": (0, 360),
-            "theta": (0, 90),
-            "a": (-0.5, 0.5),
-            "b": (-0.5, 0.5),
+            'V0': (0.5, 8.0),
+            'phi': (0, 360),
+            'theta': (0, 90), 
+            'a': (-0.5, 0.5),
+            'b': (-0.5, 0.5)
         }
-
+        
         # 优化参数
         self.INITIAL_SEARCH = 20
         self.OPT_SEARCH = 10
         self.ALPHA = 1e-2
-
+        
         # 模拟噪声（可调整以改变训练难度）
-        self.noise_std = {"V0": 0.1, "phi": 0.1, "theta": 0.1, "a": 0.003, "b": 0.003}
+        self.noise_std = {
+            'V0': 0.1,
+            'phi': 0.1,
+            'theta': 0.1,
+            'a': 0.003,
+            'b': 0.003
+        }
         self.enable_noise = False
-
+        
         print("BasicAgent (Smart, pooltool-native) 已初始化。")
 
+    
     def _create_optimizer(self, reward_function, seed):
         """创建贝叶斯优化器
-
+        
         参数：
             reward_function: 目标函数，(V0, phi, theta, a, b) -> score
             seed: 随机种子
-
+        
         返回：
             BayesianOptimization对象
         """
@@ -279,56 +255,61 @@ class BasicAgent(Agent):
             kernel=Matern(nu=2.5),
             alpha=self.ALPHA,
             n_restarts_optimizer=10,
-            random_state=seed,
+            random_state=seed
         )
-
+        
         bounds_transformer = SequentialDomainReductionTransformer(
-            gamma_osc=0.8, gamma_pan=1.0
+            gamma_osc=0.8,
+            gamma_pan=1.0
         )
-
+        
         optimizer = BayesianOptimization(
             f=reward_function,
             pbounds=self.pbounds,
             random_state=seed,
             verbose=0,
-            bounds_transformer=bounds_transformer,
+            bounds_transformer=bounds_transformer
         )
         optimizer._gp = gpr
-
+        
         return optimizer
 
+
     def decision(self, balls=None, my_targets=None, table=None):
-        """使用贝叶斯优化搜索最佳击球参数 (Optimized for Benchmark)
+        """使用贝叶斯优化搜索最佳击球参数
         
         参数：
             balls: 球状态字典，{ball_id: Ball}
             my_targets: 目标球ID列表，['1', '2', ...]
             table: 球桌对象
-
+        
         返回：
             dict: 击球动作 {'V0', 'phi', 'theta', 'a', 'b'}
                 失败时返回随机动作
         """
         if balls is None:
+            print(f"[BasicAgent] Agent decision函数未收到balls关键信息，使用随机动作。")
             return self._random_action()
         try:
-            # 简化版 BasicAgent 逻辑：大幅减少搜索次数以加快测试速度
+            
             # 保存一个击球前的状态快照，用于对比
-            last_state_snapshot = {
-                bid: copy.deepcopy(ball) for bid, ball in balls.items()
-            }
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
 
             remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
             if len(remaining_own) == 0:
                 my_targets = ["8"]
+                print("[BasicAgent] 我的目标球已全部清空，自动切换目标为：8号球")
 
             # 1.动态创建“奖励函数” (Wrapper)
+            # 贝叶斯优化器会调用此函数，并传入参数
             def reward_fn_wrapper(V0, phi, theta, a, b):
+                # 创建一个用于模拟的沙盒系统
                 sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
                 sim_table = copy.deepcopy(table)
                 cue = pt.Cue(cue_ball_id="cue")
-                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
 
+                shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+                
                 try:
                     if self.enable_noise:
                         V0_noisy = V0 + np.random.normal(0, self.noise_std['V0'])
@@ -353,37 +334,50 @@ class BasicAgent(Agent):
                 except Exception as e:
                     # 模拟失败，给予极大惩罚
                     return -500
-
+                
+                # 使用我们的“裁判”来打分
                 score = analyze_shot_for_reward(
-                    shot=shot, last_state=last_state_snapshot, player_targets=my_targets
+                    shot=shot,
+                    last_state=last_state_snapshot,
+                    player_targets=my_targets
                 )
+
+
                 return score
 
-            # 减少搜索次数
+            print(f"[BasicAgent] 正在为 Player (targets: {my_targets}) 搜索最佳击球...")
+            
             seed = np.random.randint(1e6)
             optimizer = self._create_optimizer(reward_fn_wrapper, seed)
+            optimizer.maximize(
+                init_points=self.INITIAL_SEARCH,
+                n_iter=self.OPT_SEARCH
+            )
             
-            # 使用更少的迭代次数 (例如 5 init + 2 iter)
-            optimizer.maximize(init_points=5, n_iter=2)
-
             best_result = optimizer.max
-            best_params = best_result["params"]
-            best_score = best_result["target"]
+            best_params = best_result['params']
+            best_score = best_result['target']
 
             if best_score < 10:
+                print(f"[BasicAgent] 未找到好的方案 (最高分: {best_score:.2f})。使用随机动作。")
                 return self._random_action()
-                
             action = {
-                "V0": float(best_params["V0"]),
-                "phi": float(best_params["phi"]),
-                "theta": float(best_params["theta"]),
-                "a": float(best_params["a"]),
-                "b": float(best_params["b"]),
+                'V0': float(best_params['V0']),
+                'phi': float(best_params['phi']),
+                'theta': float(best_params['theta']),
+                'a': float(best_params['a']),
+                'b': float(best_params['b']),
             }
+
+            print(f"[BasicAgent] 决策 (得分: {best_score:.2f}): "
+                  f"V0={action['V0']:.2f}, phi={action['phi']:.2f}, "
+                  f"θ={action['theta']:.2f}, a={action['a']:.3f}, b={action['b']:.3f}")
             return action
 
         except Exception as e:
-            print(f"[BasicAgent] 异常: {e}")
+            print(f"[BasicAgent] 决策时发生严重错误，使用随机动作。原因: {e}")
+            import traceback
+            traceback.print_exc()
             return self._random_action()
 
 
@@ -497,6 +491,122 @@ class NewAgent(Agent):
                 
         return False
 
+    def evaluate_position(self, table, my_targets, cue_ball_id="cue"):
+        """
+        评估当前盘面的好坏 (1-Step Lookahead)。
+        分数越高，代表母球的位置越容易打到下一颗球。
+        """
+        try:
+            # 1. 如果白球进袋了（洗袋），给极低分
+            # 注意：在 pooltool 模拟后，球的状态如果 s==4 代表落袋
+            # 但我们需要检查 cue ball 在模拟结束时的状态
+            cue_ball = table.balls.get(cue_ball_id)
+            if cue_ball is None or cue_ball.state.s == 4:
+                return -1000.0
+
+            cue_pos = cue_ball.state.rvw[0]
+            
+            # 增加：白球贴库惩罚
+            # 如果白球距离库边太近 (比如 < 1.5 * R)，击球会非常困难
+            # pooltool 桌面坐标范围通常是 x: [0, table.w], y: [0, table.l]
+            # 球半径 R ~ 0.028575
+            ball_radius = 0.028575
+            margin = 1.5 * ball_radius
+            
+            if (cue_pos[0] < margin or cue_pos[0] > table.w - margin or
+                cue_pos[1] < margin or cue_pos[1] > table.l - margin):
+                # 贴库惩罚：扣除一定分数，避免这种位置
+                # 但不至于像洗袋那样致命 (-1000)
+                # 扣 30 分，相当于一次犯规的代价
+                return -30.0
+
+            # 2. 过滤已进袋的目标球
+            valid_targets = []
+            for bid in my_targets:
+                b = table.balls.get(bid)
+                if b and b.state.s != 4:
+                    valid_targets.append(bid)
+            
+            if not valid_targets:
+                return 1000.0 # 赢了（或者只剩黑8了，视作好局面）
+
+            max_next_shot_quality = 0.0
+            
+            # 转换 balls 格式以供 _check_collision_path 使用
+            
+            for target_id in valid_targets:
+                target_ball = table.balls[target_id]
+                target_pos = target_ball.state.rvw[0]
+                
+                # 简单估算：距离
+                dist = np.linalg.norm(target_pos - cue_pos)
+                
+                # 连通性检查 (是否被阻挡)
+                obstacles = [b for bid, b in table.balls.items() if bid != target_id]
+                is_blocked = self._check_collision_path(cue_pos, target_pos, obstacles)
+                
+                if not is_blocked:
+                    # 这是一个可行的下一杆
+                    # 距离越近越好，但也别太近不好运杆
+                    if dist < 0.1: # 太近了
+                        quality = 5.0
+                    else:
+                        quality = 10.0 / (dist + 0.5)
+                    
+                    if quality > max_next_shot_quality:
+                        max_next_shot_quality = quality
+
+            # 如果所有球都被挡住了，说明走位失误（被斯诺克），给罚分
+            if max_next_shot_quality == 0:
+                return -50.0
+
+            return max_next_shot_quality * 5.0 # 权重调整
+            
+        except Exception as e:
+            # 防御性编程
+            return 0.0
+
+    def _safety_action(self, balls, my_targets):
+        """
+        防守策略：当没有好的进攻机会时，尝试轻推最近的己方球，避免犯规。
+        """
+        try:
+            cue_ball = balls["cue"]
+            cue_pos = cue_ball.state.rvw[0]
+            
+            best_target = None
+            min_dist = float("inf")
+            
+            # 找最近的有效目标球
+            for tid in my_targets:
+                if tid not in balls: continue
+                t_pos = balls[tid].state.rvw[0]
+                dist = np.linalg.norm(t_pos - cue_pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_target = tid
+            
+            if best_target:
+                t_pos = balls[best_target].state.rvw[0]
+                # 计算瞄准角度 (直接瞄准球心)
+                direction = t_pos - cue_pos
+                phi = math.atan2(direction[1], direction[0])
+                
+                # 轻推：速度刚够碰到球
+                # V0 估算: 0.5 + dist * 1.5
+                V0 = 0.5 + min_dist * 1.5
+                V0 = np.clip(V0, 0.5, 3.0)
+                
+                return {
+                    "V0": V0,
+                    "phi": math.degrees(phi),
+                    "theta": 0, "a": 0, "b": 0
+                }
+        except Exception:
+            pass
+            
+        return self._random_action()
+
     def decision(self, balls=None, my_targets=None, table=None):
         """
         基于几何与物理结合的决策策略 (NewAgent Issue 1)
@@ -518,6 +628,9 @@ class NewAgent(Agent):
         """
         if balls is None:
             return self._random_action()
+        
+        start_time = time.time()
+        TIME_LIMIT = 2.5 # Leave 0.5s margin for safety (Total ~3s)
 
         try:
             cue_ball = balls["cue"]
@@ -541,6 +654,11 @@ class NewAgent(Agent):
             
             # 2. 遍历 目标球 x 袋口
             for target_id in targets:
+                # Time check
+                if time.time() - start_time > TIME_LIMIT * 0.6: # If 60% time used in geometric search, stop early
+                    if candidate_shots: # If we have candidates, stop looking for more
+                        break
+
                 if target_id not in balls:
                     continue
                 target_ball = balls[target_id]
@@ -621,16 +739,13 @@ class NewAgent(Agent):
             # 3. 如果没有候选路径，使用随机或保守策略
             if not candidate_shots:
                 #print("[NewAgent] 未找到清晰的进攻路线，尝试解球或随机击球。")
-                # 可以尝试找一个最近的球碰一下，避免犯规
-                # 暂时Fallback到随机
-                return self._random_action()
+                # 尝试防守策略：轻推最近的球
+                return self._safety_action(balls, my_targets)
                 
             # 4. 对 Top N 候选进行物理模拟微调
             # Sort by score descending
             candidate_shots.sort(key=lambda x: x['score'], reverse=True)
             top_candidates = candidate_shots[:3] # 取前3名
-            
-            #print(f"[NewAgent] 筛选出 {len(candidate_shots)} 条路线，对前 {len(top_candidates)} 条进行物理微调...")
             
             best_action = None
             best_final_score = -float("inf")
@@ -638,34 +753,44 @@ class NewAgent(Agent):
             # 保存状态快照
             last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
             
-            # 优化：进一步减少微调次数
-            # 如果候选不多，且分数差异大，可以直接选第一名
-            # 为了 Benchmark 速度，我们减少 num_iter
-            SIM_ITER = 2 # 从 5 降到 2
-            
             for shot_plan in top_candidates:
+                # Time Check
+                if time.time() - start_time > TIME_LIMIT:
+                    break
+
                 base_phi = shot_plan['aim_angle']
                 target_id = shot_plan['target_id']
-                
-                # 在 base_phi 附近微调
-                # 距离越远，对角度越敏感。
-                # 简单起见，采样 5-10 次
+                dist = shot_plan['dist']
                 
                 # 速度估算: 距离越远力越大
-                # 基础速度: 1.5 m/s + dist * 2.0
-                base_v = 1.5 + shot_plan['dist'] * 2.5
+                base_v = 1.5 + dist * 2.5
                 base_v = np.clip(base_v, 1.0, 7.0)
                 
-                for i in range(SIM_ITER): 
-                    # 采样
-                    phi = base_phi + random.uniform(-1.5, 1.5) # 小范围微调
-                    V0 = base_v + random.uniform(-0.5, 1.0)
-                    V0 = np.clip(V0, 0.5, 8.0)
+                # 启发式微调策略 (Smart Search)
+                # 不再随机乱猜，而是有针对性地测试
+                # 1. 标准角度
+                # 2. 微调左
+                # 3. 微调右
+                if dist < 0.5:
+                    angle_offsets = [0, -1.0, 1.0]
+                else:
+                    angle_offsets = [0, -0.4, 0.4] # 远距离更敏感
+                
+                # 速度微调：也可以尝试稍微大一点力，看走位是否更好
+                # 但为了节省时间，固定用计算出的最佳力度
+                
+                for offset_phi in angle_offsets:
+                    # 再次检查时间
+                    if time.time() - start_time > TIME_LIMIT:
+                        break
+                        
+                    phi = base_phi + offset_phi
+                    V0 = base_v
                     
-                    # 简单的杆法: 中杆或轻微低杆(拉杆)
+                    # 简单的杆法: 中杆
                     theta = 0
                     a = 0
-                    b = random.uniform(-0.1, 0.1)
+                    b = 0
                     
                     # 构建模拟
                     sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
@@ -682,6 +807,10 @@ class NewAgent(Agent):
                         new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state_snapshot[bid].state.s != 4]
                         if target_id in new_pocketed:
                             score += 20 # 鼓励按计划执行
+                        
+                        # 走位评估 (Positioning)
+                        position_score = self.evaluate_position(shot.table, my_targets)
+                        score += position_score
                             
                     except Exception:
                         score = -1000
@@ -691,6 +820,12 @@ class NewAgent(Agent):
                         best_action = {
                             "V0": V0, "phi": phi, "theta": theta, "a": a, "b": b
                         }
+                
+                # Early Exit: 如果找到了很好的结果（比如进球且走位不错），就不浪费时间看后面的候选了
+                if best_final_score > 120: 
+                    # 基础分~100 + 进球奖励20 + 走位分(0~50)
+                    # >120 说明肯定进球了，且走位不是极差
+                    break
             
             if best_action is None:
                 return self._random_action()
