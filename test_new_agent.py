@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 import pooltool as pt
-from agent import NewAgent
+from agents.new_agent import NewAgent
 from pooltool.objects import Ball, Table
 from unittest.mock import MagicMock, patch
 
@@ -75,54 +75,28 @@ class TestNewAgent(unittest.TestCase):
         collision = self.agent._check_collision_path(start_pos, end_pos, [obs_ball], self.ball_radius)
         self.assertFalse(collision)
 
-    @patch('agent.pt.simulate')
-    @patch('agent.analyze_shot_for_reward')
-    def test_decision_random_fallback(self, mock_analyze, mock_simulate):
+    def test_decision_random_fallback(self):
         # If balls is None
         action = self.agent.decision(balls=None)
         self.assertIn('V0', action)
         self.assertIn('phi', action)
 
-    @patch('agent.pt.simulate')
-    def test_decision_no_valid_targets(self, mock_simulate):
-        # Setup mocks
+    def test_decision_no_valid_targets(self):
         balls = {}
-        # Cue ball
         cue_ball = MagicMock()
-        cue_ball.state.rvw = [[0, 0, 0], [0,0,0]]
+        cue_ball.state.rvw = [[0, 0, 0], [0, 0, 0]]
+        cue_ball.state.s = 1
         cue_ball.params.R = self.ball_radius
-        balls['cue'] = cue_ball
-        
-        # Target ball 1 (pocketed)
-        ball_1 = MagicMock()
-        ball_1.state.s = 4 # Pocketed
-        balls['1'] = ball_1
-        
-        my_targets = ['1']
+        balls["cue"] = cue_ball
+
+        my_targets = ["1"]
         table = MagicMock()
-        
-        # Should fallback to random or 8 ball?
-        # If '1' is pocketed, targets becomes ['8']
-        # If '8' is not in balls (or pocketed?), logic might fail or fallback
-        # Let's add '8' to balls
-        ball_8 = MagicMock()
-        ball_8.state.s = 1 # On table
-        ball_8.state.rvw = [[1, 1, 0], [0,0,0]]
-        balls['8'] = ball_8
-        
-        # Table pockets
-        pocket = MagicMock()
-        pocket.center = [2, 2, 0]
-        table.pockets = {'p1': pocket}
-        
-        # Mock calculate_ghost_ball_pos to return valid pos
-        with patch.object(self.agent, '_calculate_ghost_ball_pos', return_value=np.array([0.9, 0.9, 0])):
-             # Mock check_collision to return False (no collision)
-            with patch.object(self.agent, '_check_collision_path', return_value=False):
+        with patch.object(self.agent, "_generate_candidate_actions", return_value=[]):
+            with patch.object(self.agent, "_safety_action", return_value={"V0": 1.0, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0}):
                 action = self.agent.decision(balls, my_targets, table)
-                
-        self.assertIsNotNone(action)
-        self.assertIn('V0', action)
+
+        self.assertEqual(action["V0"], 1.0)
+        self.assertEqual(action["phi"], 0.0)
 
 if __name__ == '__main__':
     unittest.main()
