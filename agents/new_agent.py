@@ -1,17 +1,34 @@
 import math
+import time
+import copy
+import random
 import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
 from datetime import datetime
 
 from .agent import Agent
+from .basic_agent import analyze_shot_for_reward, simulate_with_timeout
 
 class NewAgent(Agent):
     """自定义 Agent 实现：基于目标球导向的蒙特卡洛搜索"""
 
     def __init__(self):
         super().__init__()
-        self.num_iter = 5  # 减少采样次数以加快速度
+        self.num_iter = 40
+        self.c_puct = 1.25
+        self.ball_radius = 0.028575
+        self.sim_noise = {
+            "V0": 0.10,
+            "phi": 0.10,
+            "theta": 0.10,
+            "a": 0.003,
+            "b": 0.003,
+        }
+        self._c_puct = 1.35
+        self._sims_midgame = 90
+        self._sims_endgame = 110
+        self._sims_break = 110
 
     def _calc_angle(self, pos1, pos2):
         """计算从pos1指向pos2的角度（度）"""
@@ -23,6 +40,26 @@ class NewAgent(Agent):
     def _calc_distance(self, pos1, pos2):
         """计算两点间距离"""
         return math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2)
+
+    def _clip_action(self, action):
+        return {
+            "V0": float(np.clip(action["V0"], 0.5, 8.0)),
+            "phi": float(action["phi"] % 360),
+            "theta": float(np.clip(action.get("theta", 0.0), 0.0, 90.0)),
+            "a": float(np.clip(action.get("a", 0.0), -0.5, 0.5)),
+            "b": float(np.clip(action.get("b", 0.0), -0.5, 0.5)),
+        }
+
+    def _add_noise(self, action):
+        return self._clip_action(
+            {
+                "V0": action["V0"] + np.random.normal(0, self.sim_noise["V0"]),
+                "phi": action["phi"] + np.random.normal(0, self.sim_noise["phi"]),
+                "theta": action.get("theta", 0.0) + np.random.normal(0, self.sim_noise["theta"]),
+                "a": action.get("a", 0.0) + np.random.normal(0, self.sim_noise["a"]),
+                "b": action.get("b", 0.0) + np.random.normal(0, self.sim_noise["b"]),
+            }
+        )
 
     def _calculate_ghost_ball_pos(self, target_pos, pocket_pos, ball_radius=0.028575):
         """
@@ -111,7 +148,7 @@ class NewAgent(Agent):
             
             # 判定阈值：2*R (球心距小于2R即碰撞)
             # 稍微加一点 margin 避免擦边太极限
-            if dist_sq < (2 * ball_radius * 1.05) ** 2:
+            if dist_sq < (2 * ball_radius * 1.10) ** 2:
                 return True
                 
         return False
@@ -167,7 +204,11 @@ class NewAgent(Agent):
                 dist = np.linalg.norm(target_pos - cue_pos)
                 
                 # 连通性检查 (是否被阻挡)
-                obstacles = [b for bid, b in table.balls.items() if bid != target_id]
+                obstacles = [
+                    b
+                    for bid, b in table.balls.items()
+                    if bid not in (target_id, cue_ball_id) and b.state.s != 4
+                ]
                 is_blocked = self._check_collision_path(cue_pos, target_pos, obstacles)
                 
                 if not is_blocked:
@@ -203,7 +244,9 @@ class NewAgent(Agent):
             min_dist = float("inf")
             
             # 找最近的有效目标球
-            for tid in my_targets:
+            remaining = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+            targets = remaining if remaining else (["8"] if "8" in balls and balls["8"].state.s != 4 else [])
+            for tid in targets:
                 if tid not in balls: continue
                 t_pos = balls[tid].state.rvw[0]
                 dist = np.linalg.norm(t_pos - cue_pos)
@@ -218,248 +261,353 @@ class NewAgent(Agent):
                 phi = math.atan2(direction[1], direction[0])
                 
                 # 轻推：速度刚够碰到球
-                # V0 估算: 0.5 + dist * 1.5
-                V0 = 0.5 + min_dist * 1.5
-                V0 = np.clip(V0, 0.5, 3.0)
+                V0 = 1.2 + min_dist * 1.8
+                V0 = np.clip(V0, 1.5, 4.0)
                 
-                return {
+                return self._clip_action({
                     "V0": V0,
                     "phi": math.degrees(phi),
                     "theta": 0, "a": 0, "b": 0
-                }
+                })
         except Exception:
             pass
-            
-        return self._random_action()
+
+        return {"V0": 1.0, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0}
+
+    def _is_break_state(self, balls, table):
+        obj_positions = []
+        for bid, b in balls.items():
+            if bid in ("cue",) or b.state.s == 4:
+                continue
+            try:
+                p = np.array(b.state.rvw[0], dtype=float)
+                obj_positions.append(p[:2])
+            except Exception:
+                continue
+        if len(obj_positions) < 12:
+            return False
+        pts = np.array(obj_positions)
+        centroid = pts.mean(axis=0)
+        spread = np.max(np.linalg.norm(pts - centroid, axis=1))
+        cue = balls.get("cue")
+        if cue is None:
+            return False
+        cue_pos = np.array(cue.state.rvw[0], dtype=float)[:2]
+        cue_to_cluster = float(np.linalg.norm(cue_pos - centroid))
+        return spread < 0.22 and cue_to_cluster > 0.45
+
+    def _break_action(self, balls, table):
+        obj_positions = []
+        for bid, b in balls.items():
+            if bid in ("cue",) or b.state.s == 4:
+                continue
+            p = np.array(b.state.rvw[0], dtype=float)
+            obj_positions.append(p[:2])
+        if not obj_positions:
+            return self._clip_action({"V0": 6.5, "phi": 0.0, "theta": 0.0, "a": 0.0, "b": 0.0})
+        centroid = np.array(obj_positions).mean(axis=0)
+        cue_pos = np.array(balls["cue"].state.rvw[0], dtype=float)[:2]
+        phi = math.degrees(math.atan2(centroid[1] - cue_pos[1], centroid[0] - cue_pos[0])) % 360
+        return self._clip_action({"V0": 7.2, "phi": phi, "theta": 0.0, "a": 0.0, "b": 0.0})
+
+    def _estimate_pot_prob(self, cut_angle_deg, dist_cue_to_ghost, dist_obj_to_pocket):
+        angle_factor = (abs(cut_angle_deg) / 60.0) ** 2
+        cue_dist_factor = dist_cue_to_ghost / 1.5
+        obj_dist_factor = dist_obj_to_pocket / 1.5
+        difficulty = angle_factor + 0.6 * cue_dist_factor + 0.6 * obj_dist_factor
+        prob = math.exp(-2.2 * difficulty)
+        return float(np.clip(prob, 0.0, 1.0))
+
+    def _extra_penalty(self, shot, last_state, player_targets):
+        try:
+            new_pocketed = [
+                bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4
+            ]
+            cue_pocketed = "cue" in new_pocketed or (shot.balls.get("cue") is not None and shot.balls["cue"].state.s == 4)
+            eight_pocketed = "8" in new_pocketed or (shot.balls.get("8") is not None and shot.balls["8"].state.s == 4)
+
+            valid_ball_ids = {
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+            }
+            first_contact_ball_id = None
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, "ids") else []
+                if ("cushion" not in et) and ("pocket" not in et) and ("cue" in ids):
+                    other_ids = [i for i in ids if i != "cue" and i in valid_ball_ids]
+                    if other_ids:
+                        first_contact_ball_id = other_ids[0]
+                        break
+
+            foul_first_hit = False
+            if first_contact_ball_id is None:
+                if len(last_state) > 2 or player_targets != ["8"]:
+                    foul_first_hit = True
+            else:
+                if first_contact_ball_id not in player_targets:
+                    foul_first_hit = True
+
+            cue_hit_cushion = False
+            target_hit_cushion = False
+            for e in shot.events:
+                et = str(e.event_type).lower()
+                ids = list(e.ids) if hasattr(e, "ids") else []
+                if "cushion" in et:
+                    if "cue" in ids:
+                        cue_hit_cushion = True
+                    if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                        target_hit_cushion = True
+
+            foul_no_rail = False
+            if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+                foul_no_rail = True
+
+            extra = 0.0
+            if cue_pocketed:
+                extra -= 220.0
+            if eight_pocketed and player_targets != ["8"]:
+                extra -= 520.0
+            if foul_first_hit:
+                extra -= 90.0
+            if foul_no_rail:
+                extra -= 70.0
+            return extra
+        except Exception:
+            return 0.0
+
+    def _generate_candidate_actions(self, balls, my_targets, table):
+        cue_ball = balls.get("cue")
+        if cue_ball is None:
+            return []
+        cue_pos = cue_ball.state.rvw[0]
+        ball_radius = getattr(cue_ball.params, "R", self.ball_radius)
+
+        remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        targets = remaining_own if remaining_own else ["8"]
+
+        candidates = []
+        for target_id in targets:
+            if target_id not in balls or balls[target_id].state.s == 4:
+                continue
+            target_pos = balls[target_id].state.rvw[0]
+
+            for pocket_id, pocket in table.pockets.items():
+                pocket_pos = pocket.center
+
+                ghost_pos = self._calculate_ghost_ball_pos(target_pos, pocket_pos, ball_radius)
+                vec_cue_to_ghost = ghost_pos - cue_pos
+                dist_cue_to_ghost = float(np.linalg.norm(vec_cue_to_ghost))
+                if dist_cue_to_ghost < 1e-6:
+                    continue
+
+                vec_ghost_to_target = target_pos - ghost_pos
+                dist_ghost_to_target = float(np.linalg.norm(vec_ghost_to_target))
+                if dist_ghost_to_target < 1e-6:
+                    continue
+
+                dir_cue_to_ghost = vec_cue_to_ghost / dist_cue_to_ghost
+                dir_ghost_to_target = vec_ghost_to_target / dist_ghost_to_target
+                cos_cut = float(np.dot(dir_cue_to_ghost, dir_ghost_to_target))
+                cut_angle_deg = float(np.degrees(np.arccos(np.clip(cos_cut, -1.0, 1.0))))
+                if abs(cut_angle_deg) > 72:
+                    continue
+
+                obstacles_obj = [
+                    b
+                    for bid, b in balls.items()
+                    if bid not in (target_id, "cue") and b.state.s != 4
+                ]
+                if self._check_collision_path(target_pos, pocket_pos, obstacles_obj, ball_radius):
+                    continue
+                if self._check_collision_path(cue_pos, ghost_pos, obstacles_obj, ball_radius):
+                    continue
+
+                dist_obj_to_pocket = float(np.linalg.norm(np.array(target_pos) - np.array(pocket_pos)))
+                prob = self._estimate_pot_prob(cut_angle_deg, dist_cue_to_ghost, dist_obj_to_pocket)
+                if prob < 0.22:
+                    continue
+
+                aim_phi = self._calc_angle(cue_pos, ghost_pos)
+                base_v = 1.6 + 2.1 * dist_cue_to_ghost + 0.35 * dist_obj_to_pocket
+                base_v = float(np.clip(base_v, 1.4, 6.8))
+
+                pocket_weight = 1.0
+                pid = str(pocket_id).lower()
+                if "c" in pid:
+                    pocket_weight = 0.88
+
+                base_score = prob * 100.0 * pocket_weight
+                if len(targets) == 1 and targets[0] == "8":
+                    base_score *= 1.25
+
+                candidates.append(
+                    {
+                        "base_score": base_score,
+                        "action": {"V0": base_v, "phi": aim_phi, "theta": 0.0, "a": 0.0, "b": 0.0},
+                        "target_id": target_id,
+                    }
+                )
+
+        candidates.sort(key=lambda x: x["base_score"], reverse=True)
+        best = candidates[:10]
+        actions = []
+        for c in best:
+            a0 = c["action"]
+            dist_scale = 0.5 if a0["V0"] < 2.0 else 0.35
+            phi_offsets = [0.0, -0.6, 0.6] if dist_scale > 0.45 else [0.0, -0.35, 0.35]
+            v_scales = [0.95, 1.0, 1.05]
+            for dp in phi_offsets:
+                for sv in v_scales:
+                    actions.append(self._clip_action({"V0": a0["V0"] * sv, "phi": a0["phi"] + dp, "theta": 0.0, "a": 0.0, "b": 0.0}))
+        if not actions:
+            actions.append(self._safety_action(balls, my_targets))
+        random.shuffle(actions)
+        return actions[:36]
+
+    def _generate_broad_actions(self, balls, my_targets, table):
+        cue_ball = balls.get("cue")
+        if cue_ball is None:
+            return []
+        cue_pos = np.array(cue_ball.state.rvw[0], dtype=float)
+
+        remaining_own = [bid for bid in my_targets if bid in balls and balls[bid].state.s != 4]
+        targets = remaining_own if remaining_own else ["8"]
+
+        actions = []
+        for target_id in targets:
+            if target_id not in balls or balls[target_id].state.s == 4:
+                continue
+            target_pos = np.array(balls[target_id].state.rvw[0], dtype=float)
+            vec = target_pos - cue_pos
+            dist = float(np.linalg.norm(vec))
+            if dist < 1e-6:
+                continue
+            phi = float(np.degrees(np.arctan2(vec[1], vec[0])) % 360)
+            base_v = float(np.clip(1.2 + dist * 2.4, 1.0, 7.6))
+
+            phi_offsets = [-0.7, 0.0, 0.7] if dist < 0.9 else [-0.45, 0.0, 0.45]
+            v_scales = [0.85, 1.0, 1.15]
+            for dp in phi_offsets:
+                for sv in v_scales:
+                    actions.append(
+                        self._clip_action(
+                            {"V0": base_v * sv, "phi": phi + dp, "theta": 0.0, "a": 0.0, "b": 0.0}
+                        )
+                    )
+
+        random.shuffle(actions)
+        return actions[:36]
+
+    def _simulate_action(self, balls, table, action):
+        sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+        sim_table = copy.deepcopy(table)
+        cue = pt.Cue(cue_ball_id="cue")
+        shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
+        noisy_action = self._add_noise(action)
+        shot.cue.set_state(
+            V0=noisy_action["V0"],
+            phi=noisy_action["phi"],
+            theta=noisy_action["theta"],
+            a=noisy_action["a"],
+            b=noisy_action["b"],
+        )
+        ok = simulate_with_timeout(shot, timeout=3)
+        return shot if ok else None
 
     def decision(self, balls=None, my_targets=None, table=None):
-        """
-        基于几何与物理结合的决策策略 (NewAgent Issue 1)
-        
-        策略流程：
-        1. 识别有效目标球 (my_targets)
-        2. 对每个目标球，遍历所有6个袋口，计算“幽灵球”位置
-        3. 剔除无效路径：
-           - 目标球到袋口被阻挡
-           - 白球到幽灵球被阻挡
-           - 击球角度过大（切球太薄）
-        4. 对候选路径进行评分：
-           - 距离越近越好
-           - 角度越正越好
-           - 优先选择容易进的袋口 (中袋通常较难)
-        5. 对 Top N 候选路径进行物理微调 (Monte Carlo Sampling)
-           - 在理论击球角附近微调 V0, phi
-           - 模拟并选择最终 Reward 最高的动作
-        """
         if balls is None:
             return self._random_action()
-        
-        start_time = time.time()
-        TIME_LIMIT = 2.5 # Leave 0.5s margin for safety (Total ~3s)
 
         try:
-            cue_ball = balls["cue"]
-            cue_pos = cue_ball.state.rvw[0]
-            ball_radius = cue_ball.params.R
-
-            # 1. 确定有效目标球
-            remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
-            if not remaining_own:
-                targets = ["8"]  # 必须打黑8
-            else:
-                targets = remaining_own
-
-            candidate_shots = [] # List of (score, target_id, pocket_id, ghost_pos, aim_angle, dist)
-            
-            # 获取所有袋口位置
-            pockets = table.pockets
-            # pockets is a dict or list? In pooltool, table.pockets is usually a dict by pocket ID
-            # Let's inspect available pockets keys if possible, or iterate values.
-            # Assuming table.pockets.values() gives pocket objects with center property
-            
-            # 2. 遍历 目标球 x 袋口
-            for target_id in targets:
-                # Time check
-                if time.time() - start_time > TIME_LIMIT * 0.6: # If 60% time used in geometric search, stop early
-                    if candidate_shots: # If we have candidates, stop looking for more
-                        break
-
-                if target_id not in balls:
-                    continue
-                target_ball = balls[target_id]
-                target_pos = target_ball.state.rvw[0]
-                
-                # 排除已经进袋的球 (double check)
-                if target_ball.state.s == 4:
-                    continue
-                    
-                for pocket_id, pocket in pockets.items():
-                    # pocket.center gives [x, y, z]
-                    pocket_pos = pocket.center
-                    
-                    # A. 计算幽灵球位置
-                    ghost_pos = self._calculate_ghost_ball_pos(target_pos, pocket_pos, ball_radius)
-                    
-                    # B. 计算击球角度 (Cut Angle)
-                    # 向量: 白球 -> 幽灵球
-                    vec_cue_to_ghost = ghost_pos - cue_pos
-                    dist_cue_to_ghost = np.linalg.norm(vec_cue_to_ghost)
-                    
-                    # 向量: 幽灵球 -> 目标球 (即击球方向)
-                    vec_ghost_to_target = target_pos - ghost_pos
-                    
-                    # 计算夹角: (白球->幽灵球) vs (幽灵球->目标球)
-                    # 如果共线 (0度)，则是正对直球。
-                    # 如果接近 90度，则是极薄切球。
-                    
-                    # 归一化
-                    if dist_cue_to_ghost < 1e-6:
-                        # 白球就在幽灵球位置（贴球），需要特殊处理，暂时跳过
-                        continue
-                        
-                    dir_cue_to_ghost = vec_cue_to_ghost / dist_cue_to_ghost
-                    dir_ghost_to_target = vec_ghost_to_target / np.linalg.norm(vec_ghost_to_target)
-                    
-                    # cos_theta = dot(u, v)
-                    cos_cut = np.dot(dir_cue_to_ghost, dir_ghost_to_target)
-                    cut_angle_rad = np.arccos(np.clip(cos_cut, -1.0, 1.0))
-                    cut_angle_deg = np.degrees(cut_angle_rad)
-                    
-                    # 剔除切球角度过大的 (例如 > 80度)
-                    if abs(cut_angle_deg) > 80:
-                        continue
-                        
-                    # C. 碰撞检测
-                    # Path 1: Target -> Pocket
-                    # 障碍球: 除了 Target 和 Cue 之外的所有球 (包括黑8，除非它是目标)
-                    obstacles_1 = [b for bid, b in balls.items() if bid != target_id and bid != 'cue' and b.state.s != 4]
-                    if self._check_collision_path(target_pos, pocket_pos, obstacles_1, ball_radius):
-                        continue # 目标球进袋路线被挡
-                        
-                    # Path 2: Cue -> Ghost Ball
-                    # 障碍球: 除了 Cue 和 Target 之外的所有球
-                    # 注意：目标球本身不能算作“白球到幽灵球”路径上的障碍，因为幽灵球就是紧贴目标球的
-                    obstacles_2 = [b for bid, b in balls.items() if bid != target_id and bid != 'cue' and b.state.s != 4]
-                    if self._check_collision_path(cue_pos, ghost_pos, obstacles_2, ball_radius):
-                        continue # 白球击打路线被挡
-                        
-                    # D. 基础评分 (Heuristic Score)
-                    # 距离越近分越高
-                    # 角度越小分越高
-                    score = 100.0
-                    score -= dist_cue_to_ghost * 10.0 # 距离惩罚
-                    score -= abs(cut_angle_deg) * 1.0 # 角度惩罚 (1度扣1分)
-                    
-                    # 计算物理瞄准角度 phi
-                    aim_angle = self._calc_angle(cue_pos, ghost_pos)
-                    
-                    candidate_shots.append({
-                        'score': score,
-                        'target_id': target_id,
-                        'pocket_id': pocket_id,
-                        'aim_angle': aim_angle,
-                        'dist': dist_cue_to_ghost
-                    })
-
-            # 3. 如果没有候选路径，使用随机或保守策略
-            if not candidate_shots:
-                #print("[NewAgent] 未找到清晰的进攻路线，尝试解球或随机击球。")
-                # 尝试防守策略：轻推最近的球
-                return self._safety_action(balls, my_targets)
-                
-            # 4. 对 Top N 候选进行物理模拟微调
-            # Sort by score descending
-            candidate_shots.sort(key=lambda x: x['score'], reverse=True)
-            top_candidates = candidate_shots[:3] # 取前3名
-            
-            best_action = None
-            best_final_score = -float("inf")
-            
-            # 保存状态快照
-            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-            
-            for shot_plan in top_candidates:
-                # Time Check
-                if time.time() - start_time > TIME_LIMIT:
-                    break
-
-                base_phi = shot_plan['aim_angle']
-                target_id = shot_plan['target_id']
-                dist = shot_plan['dist']
-                
-                # 速度估算: 距离越远力越大
-                base_v = 1.5 + dist * 2.5
-                base_v = np.clip(base_v, 1.0, 7.0)
-                
-                # 启发式微调策略 (Smart Search)
-                # 不再随机乱猜，而是有针对性地测试
-                # 1. 标准角度
-                # 2. 微调左
-                # 3. 微调右
-                if dist < 0.5:
-                    angle_offsets = [0, -1.0, 1.0]
+            targets = my_targets or []
+            remaining_targets = [bid for bid in targets if bid in balls and balls[bid].state.s != 4]
+            if not remaining_targets:
+                if "8" in balls and balls["8"].state.s != 4:
+                    remaining_targets = ["8"]
                 else:
-                    angle_offsets = [0, -0.4, 0.4] # 远距离更敏感
-                
-                # 速度微调：也可以尝试稍微大一点力，看走位是否更好
-                # 但为了节省时间，固定用计算出的最佳力度
-                
-                for offset_phi in angle_offsets:
-                    # 再次检查时间
-                    if time.time() - start_time > TIME_LIMIT:
-                        break
-                        
-                    phi = base_phi + offset_phi
-                    V0 = base_v
-                    
-                    # 简单的杆法: 中杆
-                    theta = 0
-                    a = 0
-                    b = 0
-                    
-                    # 构建模拟
-                    sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-                    sim_table = copy.deepcopy(table)
-                    cue = pt.Cue(cue_ball_id="cue")
-                    shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
-                    shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
-                    
-                    try:
-                        pt.simulate(shot, inplace=True)
-                        score = analyze_shot_for_reward(shot, last_state_snapshot, my_targets)
-                        
-                        # 额外奖励：如果打进了计划中的球
-                        new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state_snapshot[bid].state.s != 4]
-                        if target_id in new_pocketed:
-                            score += 20 # 鼓励按计划执行
-                        
-                        # 走位评估 (Positioning)
-                        position_score = self.evaluate_position(shot.table, my_targets)
-                        score += position_score
-                            
-                    except Exception:
-                        score = -1000
-                        
-                    if score > best_final_score:
-                        best_final_score = score
-                        best_action = {
-                            "V0": V0, "phi": phi, "theta": theta, "a": a, "b": b
-                        }
-                
-                # Early Exit: 如果找到了很好的结果（比如进球且走位不错），就不浪费时间看后面的候选了
-                if best_final_score > 120: 
-                    # 基础分~100 + 进球奖励20 + 走位分(0~50)
-                    # >120 说明肯定进球了，且走位不是极差
-                    break
-            
-            if best_action is None:
-                return self._random_action()
-                
-            #print(f"[NewAgent] 最终决策 (预期得分 {best_final_score:.1f}): V0={best_action['V0']:.2f}, phi={best_action['phi']:.2f}")
-            return best_action
+                    return self._safety_action(balls, targets)
+
+            is_break = self._is_break_state(balls, table)
+            is_endgame = (remaining_targets == ["8"]) or (len([b for b in remaining_targets if b != "8"]) <= 2)
+
+            sims = self._sims_break if is_break else (self._sims_endgame if is_endgame else self._sims_midgame)
+            last_state_snapshot = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+            candidate_actions = []
+            if is_break:
+                base = self._break_action(balls, table)
+                candidate_actions.extend(
+                    [
+                        base,
+                        self._clip_action({**base, "V0": base["V0"] * 0.95}),
+                        self._clip_action({**base, "V0": base["V0"] * 1.03}),
+                        self._clip_action({**base, "phi": base["phi"] + 0.6}),
+                        self._clip_action({**base, "phi": base["phi"] - 0.6}),
+                    ]
+                )
+                for _ in range(6):
+                    candidate_actions.append(self._random_action())
+            else:
+                candidate_actions.extend(self._generate_broad_actions(balls, remaining_targets, table))
+                candidate_actions.extend(self._generate_candidate_actions(balls, remaining_targets, table))
+                candidate_actions.append(self._safety_action(balls, remaining_targets))
+                for _ in range(5):
+                    candidate_actions.append(self._random_action())
+
+            if not candidate_actions:
+                return self._safety_action(balls, remaining_targets)
+
+            n_candidates = len(candidate_actions)
+            N = np.zeros(n_candidates, dtype=float)
+            Q = np.zeros(n_candidates, dtype=float)
+
+            for i in range(sims):
+                if i < n_candidates:
+                    idx = i
+                else:
+                    total_n = float(np.sum(N))
+                    ucb_values = (Q / (N + 1e-6)) + self._c_puct * np.sqrt(np.log(total_n + 1.0) / (N + 1e-6))
+                    idx = int(np.argmax(ucb_values))
+
+                shot = self._simulate_action(balls, table, candidate_actions[idx])
+                if shot is None:
+                    raw_reward = -800.0
+                else:
+                    raw_reward = float(analyze_shot_for_reward(shot, last_state_snapshot, remaining_targets))
+                    raw_reward += float(self._extra_penalty(shot, last_state_snapshot, remaining_targets))
+                    raw_reward += 0.30 * float(self.evaluate_position(shot.table, remaining_targets))
+
+                normalized_reward = (raw_reward - (-800.0)) / (300.0 - (-800.0))
+                normalized_reward = float(np.clip(normalized_reward, 0.0, 1.0))
+
+                N[idx] += 1.0
+                Q[idx] += normalized_reward
+
+            avg_rewards = Q / (N + 1e-6)
+            best_idx = int(np.argmax(avg_rewards))
+            best_action = candidate_actions[best_idx]
+
+            if float(avg_rewards[best_idx]) < 0.52:
+                return self._safety_action(balls, remaining_targets)
+
+            return self._clip_action(best_action)
 
         except Exception as e:
             print(f"[NewAgent] 决策异常: {e}")
             import traceback
             traceback.print_exc()
-            return self._random_action()
+            return self._safety_action(balls, my_targets)
