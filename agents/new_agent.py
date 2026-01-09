@@ -7,8 +7,169 @@ import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
 from datetime import datetime
 
-from .agent import Agent
-from .basic_agent import analyze_shot_for_reward, simulate_with_timeout
+class Agent():
+    """Agent 基类"""
+    def __init__(self):
+        pass
+    
+    def decision(self, *args, **kwargs):
+        """决策方法（子类需实现）
+        
+        返回：dict, 包含 'V0', 'phi', 'theta', 'a', 'b'
+        """
+        pass
+    
+    def _random_action(self,):
+        """生成随机击球动作
+        
+        返回：dict
+            V0: [0.5, 8.0] m/s
+            phi: [0, 360] 度
+            theta: [0, 90] 度
+            a, b: [-0.5, 0.5] 球半径比例
+        """
+        action = {
+            'V0': round(random.uniform(0.5, 8.0), 2),   # 初速度 0.5~8.0 m/s
+            'phi': round(random.uniform(0, 360), 2),    # 水平角度 (0°~360°)
+            'theta': round(random.uniform(0, 90), 2),   # 垂直角度
+            'a': round(random.uniform(-0.5, 0.5), 3),   # 杆头横向偏移（单位：球半径比例）
+            'b': round(random.uniform(-0.5, 0.5), 3)    # 杆头纵向偏移
+        }
+        return action
+
+
+def simulate_with_timeout(shot, timeout=3):
+    """带超时保护的物理模拟
+    
+    参数：
+        shot: pt.System 对象
+        timeout: 超时时间（秒），默认3秒
+    
+    返回：
+        bool: True 表示模拟成功，False 表示超时或失败
+    
+    说明：
+        使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
+        超时后自动恢复，不会导致程序卡死
+    """
+    # 设置超时信号处理器
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(timeout)  # 设置超时时间
+    
+    try:
+        pt.simulate(shot, inplace=True)
+        signal.alarm(0)  # 取消超时
+        return True
+    except SimulationTimeoutError:
+        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+        return False
+    except Exception as e:
+        signal.alarm(0)  # 取消超时
+        raise e
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+
+def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
+    """
+    分析击球结果并计算奖励分数（完全对齐台球规则）
+    
+    参数：
+        shot: 已完成物理模拟的 System 对象
+        last_state: 击球前的球状态，{ball_id: Ball}
+        player_targets: 当前玩家目标球ID，['1', '2', ...] 或 ['8']
+    
+    返回：
+        float: 奖励分数
+            +50/球（己方进球）, +100（合法黑8）, +10（合法无进球）
+            -100（白球进袋）, -150（非法黑8/白球+黑8）, -30（首球/碰库犯规）
+    
+    规则核心：
+        - 清台前：player_targets = ['1'-'7'] 或 ['9'-'15']，黑8不属于任何人
+        - 清台后：player_targets = ['8']，黑8成为唯一目标球
+    """
+    
+    # 1. 基本分析
+    new_pocketed = [bid for bid, b in shot.balls.items() if b.state.s == 4 and last_state[bid].state.s != 4]
+    
+    # 根据 player_targets 判断进球归属（黑8只有在清台后才算己方球）
+    own_pocketed = [bid for bid in new_pocketed if bid in player_targets]
+    enemy_pocketed = [bid for bid in new_pocketed if bid not in player_targets and bid not in ["cue", "8"]]
+    
+    cue_pocketed = "cue" in new_pocketed
+    eight_pocketed = "8" in new_pocketed
+
+    # 2. 分析首球碰撞（定义合法的球ID集合）
+    first_contact_ball_id = None
+    foul_first_hit = False
+    valid_ball_ids = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'}
+    
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if ('cushion' not in et) and ('pocket' not in et) and ('cue' in ids):
+            # 过滤掉 'cue' 和非球对象（如 'cue stick'），只保留合法的球ID
+            other_ids = [i for i in ids if i != 'cue' and i in valid_ball_ids]
+            if other_ids:
+                first_contact_ball_id = other_ids[0]
+                break
+    
+    # 首球犯规判定：完全对齐 player_targets
+    if first_contact_ball_id is None:
+        # 未击中任何球（但若只剩白球和黑8且已清台，则不算犯规）
+        if len(last_state) > 2 or player_targets != ['8']:
+            foul_first_hit = True
+    else:
+        # 首次击打的球必须是 player_targets 中的球
+        if first_contact_ball_id not in player_targets:
+            foul_first_hit = True
+    
+    # 3. 分析碰库
+    cue_hit_cushion = False
+    target_hit_cushion = False
+    foul_no_rail = False
+    
+    for e in shot.events:
+        et = str(e.event_type).lower()
+        ids = list(e.ids) if hasattr(e, 'ids') else []
+        if 'cushion' in et:
+            if 'cue' in ids:
+                cue_hit_cushion = True
+            if first_contact_ball_id is not None and first_contact_ball_id in ids:
+                target_hit_cushion = True
+
+    if len(new_pocketed) == 0 and first_contact_ball_id is not None and (not cue_hit_cushion) and (not target_hit_cushion):
+        foul_no_rail = True
+        
+    # 4. 计算奖励分数
+    score = 0
+    
+    # 白球进袋处理
+    if cue_pocketed and eight_pocketed:
+        score -= 150  # 白球+黑8同时进袋，严重犯规
+    elif cue_pocketed:
+        score -= 100  # 白球进袋
+    elif eight_pocketed:
+        # 黑8进袋：只有清台后（player_targets == ['8']）才合法
+        if player_targets == ['8']:
+            score += 100  # 合法打进黑8
+        else:
+            score -= 150  # 清台前误打黑8，判负
+            
+    # 首球犯规和碰库犯规
+    if foul_first_hit:
+        score -= 30
+    if foul_no_rail:
+        score -= 30
+        
+    # 进球得分（own_pocketed 已根据 player_targets 正确分类）
+    score += len(own_pocketed) * 50
+    score -= len(enemy_pocketed) * 20
+    
+    # 合法无进球小奖励
+    if score == 0 and not cue_pocketed and not eight_pocketed and not foul_first_hit and not foul_no_rail:
+        score = 10
+        
+    return score
 
 class NewAgent(Agent):
     """自定义 Agent 实现：基于目标球导向的蒙特卡洛搜索"""
