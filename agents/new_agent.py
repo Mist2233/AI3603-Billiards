@@ -6,6 +6,8 @@ import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
 from datetime import datetime
+import signal
+
 
 class Agent():
     """Agent 基类"""
@@ -37,6 +39,13 @@ class Agent():
         }
         return action
 
+class SimulationTimeoutError(Exception):
+    """物理模拟超时异常"""
+    pass
+
+def _timeout_handler(signum, frame):
+    """超时信号处理器"""
+    raise SimulationTimeoutError("物理模拟超时")
 
 def simulate_with_timeout(shot, timeout=3):
     """带超时保护的物理模拟
